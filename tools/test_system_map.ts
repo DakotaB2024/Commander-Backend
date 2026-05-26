@@ -1,0 +1,1 @@
+import { run } from './update_system_map.ts'; run({}, {});

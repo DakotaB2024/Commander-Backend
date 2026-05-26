@@ -1,110 +1,160 @@
 import dotenv from 'dotenv';
-dotenv.config(); // Must be called first!
-
 import express from 'express';
 import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import Groq from 'groq-sdk';
 import PocketBase from 'pocketbase';
-import { fileTools, executionTools } from './fileManager';
+import { fileTools, executionTools } from './fileManager.ts';
+
+dotenv.config();
+
+// Path Setup
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const ROOT_DIR = path.join(__dirname, '..');
 
 const app = express();
 const port = process.env.PORT || 5000;
 
-// 1. Configure CORS to allow your frontend
-app.use(cors({
-  origin: 'http://localhost:3001',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  credentials: true
-}));
-
+app.use(cors({ origin: 'http://localhost:3001', credentials: true }));
 app.use(express.json());
-
-// 2. Initialize Clients
-if (!process.env.GROQ_API_KEY) {
-  console.error("CRITICAL: GROQ_API_KEY is missing from environment!");
-} else {
-  console.log("API Key loaded successfully.");
-}
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const pb = new PocketBase('http://127.0.0.1:8090');
+pb.autoCancellation(false);
 
-// 3. Helper to save to PocketBase
-async function saveChatToPocketBase(userMessage: string, agentResponse: string) {
+// POCKETBASE ADMIN AUTHENTICATION
+async function authenticateAdmin() {
+    try {
+        const authData = await pb.admins.authWithPassword(
+            process.env.PB_ADMIN_EMAIL!, 
+            process.env.PB_ADMIN_PASSWORD!
+        );
+        console.log("[POCKETBASE] Admin authenticated successfully.");
+        pb.authStore.save(authData.token, authData.admin);
+    } catch (err: any) {
+        console.error("Auth Error:", err.message);
+    }
+}
+
+// ROBUST THREAD FETCHING
+app.get('/api/threads', async (req, res, next) => {
+    try {
+        console.log("[DEBUG] Testing absolute minimal fetch...");
+        
+        // No sort, no pagination params
+        const result = await pb.collection('threads').getFullList();
+
+        res.json(result);
+    } catch (err: any) {
+        console.error("--- MINIMAL FETCH ERROR ---");
+        console.error(err);
+        next(err);
+    }
+});
+
+
+// THREAD MANAGEMENT ENDPOINTS
+app.post('/api/threads/create', async (req, res) => {
+    const { title } = req.body; 
+    try {
+        const thread = await pb.collection('threads').create({ 
+            title: title || "New Chat" 
+        });
+        res.json({ threadId: thread.id });
+    } catch (err: any) { 
+        console.error("Create Thread Error:", err);
+        res.status(500).json({ error: err.message }); 
+    }
+});
+
+// CHAT AND HELPER ENDPOINTS
+app.get('/api/health', (req, res) => res.json({ status: "alive" }));
+
+async function getDynamicTools() {
+  const toolsDir = path.join(ROOT_DIR, 'tools');
+  if (!fs.existsSync(toolsDir)) fs.mkdirSync(toolsDir);
+  const toolFiles = fs.readdirSync(toolsDir).filter(f => f.endsWith('.ts') || f.endsWith('.js'));
+  return toolFiles.map(file => ({ 
+      type: 'function', 
+      function: { name: path.parse(file).name, description: `Executes ${path.parse(file).name}`, parameters: { type: 'object', properties: {} } } 
+  }));
+}
+
+async function saveChatToPocketBase(threadId: string, userMessage: string, agentResponse: string) {
   try {
     await pb.collection('chat_history').create({
+      thread_id: threadId,
       user_input: userMessage,
       agent_output: agentResponse,
       created: new Date().toISOString()
     });
-  } catch (err) {
-    console.error("PocketBase Save Error:", err);
-  }
+  } catch (err) { console.error("PocketBase Save Error:", err); }
 }
 
-// 4. Tools Configuration
-const agentToolsConfiguration: any[] = [
-  { type: 'function', function: { name: 'list_files', description: 'Lists files in workspace.', parameters: { type: 'object', properties: {}, required: [] } } },
-  { type: 'function', function: { name: 'read_file', description: 'Reads file contents.', parameters: { type: 'object', properties: { filePath: { type: 'string' } }, required: ['filePath'] } } },
-  { type: 'function', function: { name: 'write_file', description: 'Writes file.', parameters: { type: 'object', properties: { filePath: { type: 'string' }, content: { type: 'string' } }, required: ['filePath', 'content'] } } },
-  { type: 'function', function: { name: 'execute_command', description: 'Runs terminal commands.', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } }
-];
+app.get('/api/messages', async (req, res) => {
+    const { threadId } = req.query;
+    console.log(`[DEBUG] Attempting to fetch for thread: ${threadId}`);
 
-// 5. Routes
-app.get('/api/files', async (req, res) => {
-  try {
-    const files = await fileTools.listFiles();
-    res.json(files);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
+    try {
+        // Use a very simple filter. If your schema field is 'thread_id', this works.
+        const records = await pb.collection('chat_history').getList(1, 50, {
+            filter: `thread_id = "${threadId}"`,
+        });
+        
+        console.log(`[DEBUG] Found ${records.items.length} records.`);
+        res.json(records.items);
+    } catch (err: any) {
+        // Log the full error from PocketBase
+        console.error("--- POCKETBASE ERROR ---");
+        console.error(JSON.stringify(err.originalError || err, null, 2));
+        res.status(500).json({ error: "DB Query failed" });
+    }
 });
 
+
+// server.ts
 app.post('/api/chat', async (req, res) => {
-  try {
-    const { messages } = req.body;
-    
-    const response = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages: messages,
-      tools: agentToolsConfiguration,
-      tool_choice: 'auto'
+    const { messages, threadId } = req.body;
+
+    // 1. Send messages to your AI model
+    const response = await aiClient.chat.completions.create({
+        messages,
+        tools: [...yourToolDefinitions], // Ensure these are defined
+        tool_choice: "auto"
     });
 
-    const responseMessage = response.choices[0].message;
-    messages.push(responseMessage);
+    const aiMessage = response.choices[0].message;
 
-    if (responseMessage.tool_calls) {
-      for (const toolCall of responseMessage.tool_calls) {
-        const toolName = toolCall.function.name;
-        const args = JSON.parse(toolCall.function.arguments);
-        let toolResult = '';
-
-        try {
-          switch (toolName) {
-            case 'list_files': toolResult = JSON.stringify(await fileTools.listFiles()); break;
-            case 'read_file': toolResult = await fileTools.readFile(args.filePath); break;
-            case 'write_file': toolResult = await fileTools.writeFile(args.filePath, args.content); break;
-            case 'execute_command': toolResult = await executionTools.executeCommand(args.command); break;
-          }
-        } catch (execErr: any) { toolResult = `Error: ${execErr.message}`; }
-
-        messages.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult });
-      }
-
-      const secondaryResponse = await groq.chat.completions.create({ model: 'llama-3.3-70b-versatile', messages: messages });
-      const finalReply = secondaryResponse.choices[0].message;
-      messages.push(finalReply);
-      
-      // Save the chat to your 16TB drive via PocketBase
-      await saveChatToPocketBase(messages[messages.length - 3]?.content || "Init", finalReply.content || "");
+    // 2. If the AI wants to use a tool:
+    if (aiMessage.tool_calls) {
+        // Execute your local file system function here...
+        const toolResult = await executeTool(aiMessage.tool_calls[0]);
+        
+        // 3. Save the result back to your PocketBase chat_history
+        await pb.collection('chat_history').create({
+            thread_id: threadId,
+            user_input: "TOOL_EXECUTION",
+            agent_output: JSON.stringify(toolResult)
+        });
+        
+        // Return the tool result to the frontend
+        return res.json({ messages: [...messages, aiMessage, toolResult] });
     }
-
-    res.json({ messages });
-  } catch (error: any) {
-    console.error('Chat Error:', error);
-    res.status(500).json({ error: error.message });
-  }
+    
+    // ... normal chat response
 });
 
+
+// STARTUP
+await authenticateAdmin();
 app.listen(port, () => console.log(`[SERVER UP] Backend ready on port ${port}`));
+
+// ERROR HANDLING
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("--- FULL ERROR STACK ---");
+    console.error(err.stack);
+    res.status(500).json({ error: "Internal Server Error", details: err.message });
+});

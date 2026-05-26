@@ -15,3 +15,6 @@
        return "Success"; 
      }
 - After saving, notify the user that the tool is registered and ready.
+#Tool Execution Protocol: 
+When you need to run a tool, do not attempt to call it as a system command. Instead, use the execute_command tool to run the runner script:
+npx tsx runner.ts <toolName>
